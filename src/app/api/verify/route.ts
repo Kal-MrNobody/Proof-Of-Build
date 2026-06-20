@@ -1,50 +1,85 @@
 import { NextResponse } from 'next/server';
-import { insertVerification } from '@/lib/db';
+import { getServerSession } from 'next-auth';
+import { authOptions } from '@/lib/auth';
+import { prisma } from '@/lib/db';
+import { runVerification } from '@/lib/verify';
 
 export async function POST(req: Request) {
   try {
-    const { repoUrl, deployUrl } = await req.json();
-
-    if (!repoUrl) {
-      return NextResponse.json({ error: 'Repository URL is required' }, { status: 400 });
+    const session = await getServerSession(authOptions);
+    if (!session || !session.user || !session.accessToken) {
+      return NextResponse.json({ error: 'Unauthorized. Please sign in with GitHub.' }, { status: 401 });
     }
 
-    // --- 1. Automated Code & Contribution Analysis (Mock Heuristic) ---
-    // In a production app, we would use the GitHub API via Octokit here.
-    // For now, we simulate a complexity heuristic.
-    const complexityScore = Math.floor(Math.random() * (100 - 50 + 1) + 50); // Score between 50 and 100
-    const mockLanguages = ['TypeScript', 'Python', 'React', 'Go'];
-    const selectedLangs = mockLanguages.sort(() => 0.5 - Math.random()).slice(0, 2).join(', ');
+    const { repoOwner, repoName, deployUrl } = await req.json();
 
-    // --- 2. Live Deployment Verification ---
-    let deploymentStatus = 'None';
-    if (deployUrl) {
-      try {
-        const response = await fetch(deployUrl, { method: 'HEAD', signal: AbortSignal.timeout(5000) });
-        if (response.ok) {
-          deploymentStatus = 'Active (200 OK)';
-        } else {
-          deploymentStatus = \`Error (\${response.status})\`;
-        }
-      } catch (e) {
-        deploymentStatus = 'Unreachable';
+    if (!repoOwner || !repoName) {
+      return NextResponse.json({ error: 'Repository owner and name are required' }, { status: 400 });
+    }
+
+    // Run the actual verification
+    const result = await runVerification(repoOwner, repoName, session.accessToken, deployUrl);
+
+    // Save to Postgres via Prisma
+    const user = await prisma.user.findUnique({ where: { id: session.user.id } });
+    if (!user) {
+       return NextResponse.json({ error: 'User not found' }, { status: 404 });
+    }
+
+    // Upsert Repo
+    const repo = await prisma.repo.upsert({
+      where: { githubId: result.repoDetails.githubId },
+      update: {
+        name: result.repoDetails.name,
+        fullName: result.repoDetails.fullName,
+        url: result.repoDetails.url,
+      },
+      create: {
+        githubId: result.repoDetails.githubId,
+        name: result.repoDetails.name,
+        fullName: result.repoDetails.fullName,
+        url: result.repoDetails.url,
+        ownerLogin: result.repoDetails.ownerLogin,
+        userId: user.id
       }
+    });
+
+    let deploymentCheckRecord = null;
+    if (result.deploymentCheck) {
+      deploymentCheckRecord = await prisma.deploymentCheck.create({
+        data: {
+          url: result.deploymentCheck.url,
+          status: result.deploymentCheck.status,
+          statusCode: result.deploymentCheck.statusCode,
+          responseTimeMs: result.deploymentCheck.responseTimeMs,
+          hasHSTS: result.deploymentCheck.hasHSTS,
+          hasCSP: result.deploymentCheck.hasCSP
+        }
+      });
     }
 
-    // --- 3. Update Dynamic Proof Ledger ---
-    const verificationData = {
-      repo_url: repoUrl,
-      deploy_url: deployUrl || '',
-      complexity_score: complexityScore,
-      languages: selectedLangs,
-      deployment_status: deploymentStatus,
-    };
+    // Create Verification Run
+    const verificationRun = await prisma.verificationRun.create({
+      data: {
+        repoId: repo.id,
+        complexityScore: result.complexityScore,
+        locTotal: result.locTotal,
+        languageStats: result.languageStats,
+        contributorCount: result.contributorCount,
+        hasTests: result.hasTests,
+        hasCI: result.hasCI,
+        integrityHash: result.integrityHash,
+        deploymentCheckId: deploymentCheckRecord?.id
+      },
+      include: {
+        repo: true,
+        deploymentCheck: true
+      }
+    });
 
-    insertVerification(verificationData);
-
-    return NextResponse.json({ success: true, data: verificationData });
-  } catch (error) {
+    return NextResponse.json({ success: true, data: verificationRun });
+  } catch (error: any) {
     console.error('Verification error:', error);
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+    return NextResponse.json({ error: error.message || 'Internal server error' }, { status: 500 });
   }
 }
